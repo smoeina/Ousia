@@ -122,6 +122,10 @@ To make a PDF, export DOCX and convert it with your local document software or a
 
 The Share button creates a public link for a file. When `PUBLIC_TUNNEL_ORIGIN` is set, the link uses that tunnel even if you opened Ousia through localhost. Keep the app and tunnel running for others to view shared files or submit shared forms; form responses are saved in the project folder.
 
+## License
+
+Released under the [PolyForm Noncommercial License 1.0.0](./LICENSE.md). Noncommercial use only.
+
 ## Development commands
 
 ```bash
