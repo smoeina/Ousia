@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm exec eslint .
+      - run: pnpm build
+      - run: pnpm build:eve
+      - name: Package build artifacts
+        run: |
+          mkdir -p dist
+          cp package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc next.config.ts drizzle.config.ts tsconfig.json dist/
+          cp -r .next .output drizzle scripts public dist/
+          tar -czf ousia-build.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ousia-build
+          path: ousia-build.tar.gz
+          retention-days: 14

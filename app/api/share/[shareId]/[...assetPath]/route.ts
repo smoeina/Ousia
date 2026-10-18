@@ -1,0 +1,219 @@
+import path from "node:path";
+import { NextResponse } from "next/server";
+import { eq } from "drizzle-orm";
+
+import { db } from "@/db";
+import { publicFiles, projects } from "@/db/schema";
+import { withFormTheme } from "@/lib/forms/runtime";
+import { parseBibtexEntries } from "@/lib/bibtex";
+import { normalizeEscapedCitations, replaceMarkdownCitations } from "@/lib/markdown-bibliography";
+import { PROJECT_BIBLIOGRAPHY_PATH } from "@/lib/project-bibliography";
+import {
+  readAgentWorkspaceFile,
+  getWorkspaceFileFingerprint,
+  AgentWorkspaceError,
+} from "@/lib/workspace-files";
+import { resolveWorkspaceAssetPath } from "@/app/[projectId]/_components/editors/markdown-image-path";
+
+// Serves the shared file, its referenced images, and only the bibliography
+// entries cited by a shared Markdown document.
+
+const MARKDOWN_IMAGE_SOURCE = /!\[[^\]]*\]\(\s*<?([^)\s>]+)>?[^)]*\)/g;
+const HTML_IMAGE_SOURCE = /<img[^>]+src=["']([^"']+)["']/gi;
+
+// Existing form files embed their own light/dark CSS, so add this bridge when
+// serving a shared form. The parent can switch its theme without reloading the
+// sandboxed iframe and discarding a respondent's in-progress answers.
+const FORM_THEME_BRIDGE = `<style>html.bf-embedded #bf-theme-toggle { display: none !important; }</style><script>
+if (window !== window.parent) document.documentElement.classList.add("bf-embedded");
+window.addEventListener("message", function (event) {
+  if (event.source !== window.parent || !event.data || event.data.type !== "ousia:theme") return;
+  if (event.data.theme !== "light" && event.data.theme !== "dark") return;
+  document.documentElement.classList.toggle("bf-dark", event.data.theme === "dark");
+});
+</script>`;
+
+async function referencedAssetPaths(
+  ownerUserId: string,
+  projectSlug: string,
+  filePath: string,
+): Promise<Set<string>> {
+  const allowed = new Set<string>();
+  if (!/\.(md|markdown|mdx)$/i.test(filePath)) return allowed;
+
+  let markdown: string;
+  try {
+    const response = await readAgentWorkspaceFile(ownerUserId, projectSlug, filePath);
+    markdown = await response.text();
+  } catch {
+    return allowed;
+  }
+
+  const sources = new Set<string>();
+  for (const match of markdown.matchAll(MARKDOWN_IMAGE_SOURCE)) sources.add(match[1]);
+  for (const match of markdown.matchAll(HTML_IMAGE_SOURCE)) sources.add(match[1]);
+
+  for (const source of sources) {
+    const resolved = resolveWorkspaceAssetPath(filePath, source);
+    if (resolved) allowed.add(resolved.path);
+  }
+  return allowed;
+}
+
+async function citedBibliography(ownerUserId: string, projectSlug: string, filePath: string) {
+  const [document, bibliography] = await Promise.all([
+    readAgentWorkspaceFile(ownerUserId, projectSlug, filePath),
+    readAgentWorkspaceFile(ownerUserId, projectSlug, PROJECT_BIBLIOGRAPHY_PATH),
+  ]);
+  const markdown = normalizeEscapedCitations(await document.text());
+  const { citedIds } = replaceMarkdownCitations(markdown, (id) => `[@${id}]`);
+  const cited = new Set(citedIds);
+  const source = await bibliography.text();
+  return parseBibtexEntries(source)
+    .filter((entry) => cited.has(entry.key))
+    .map((entry) => source.slice(entry.start, entry.end))
+    .join("\n\n");
+}
+
+const CONTENT_TYPES: Record<string, string> = {
+  ".md": "text/markdown; charset=utf-8",
+  ".markdown": "text/markdown; charset=utf-8",
+  ".mdx": "text/markdown; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".htm": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".csv": "text/csv; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".bmp": "image/bmp",
+  ".avif": "image/avif",
+  ".pdf": "application/pdf",
+  ".mp3": "audio/mpeg",
+  ".m4a": "audio/mp4",
+  ".aac": "audio/aac",
+  ".wav": "audio/wav",
+  ".flac": "audio/flac",
+  ".oga": "audio/ogg",
+  ".ogg": "audio/ogg",
+  ".opus": "audio/ogg",
+  ".mp4": "video/mp4",
+  ".m4v": "video/mp4",
+  ".mov": "video/quicktime",
+  ".webm": "video/webm",
+  ".ogv": "video/ogg",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".odt": "application/vnd.oasis.opendocument.text",
+  ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+  ".odp": "application/vnd.oasis.opendocument.presentation",
+};
+
+async function serveAsset(
+  request: Request,
+  { params }: { params: Promise<{ shareId: string; assetPath: string[] }> },
+  head: boolean,
+) {
+  const { shareId, assetPath } = await params;
+  const rel = assetPath.map((segment) => path.basename(segment)).join("/");
+
+  const fileRecord = await db.query.publicFiles.findFirst({
+    where: eq(publicFiles.id, shareId),
+  });
+  if (!fileRecord) return new NextResponse("Not Found", { status: 404 });
+
+  const project = await db.query.projects.findFirst({
+    where: eq(projects.id, fileRecord.projectId),
+  });
+  if (!project) return new NextResponse("Not Found", { status: 404 });
+
+  const isSharedBibliography = rel === PROJECT_BIBLIOGRAPHY_PATH && /\.(md|markdown|mdx)$/i.test(fileRecord.filePath);
+  if (rel !== fileRecord.filePath && !isSharedBibliography) {
+    const allowed = await referencedAssetPaths(project.userId, project.slug, fileRecord.filePath);
+    if (!allowed.has(rel)) {
+      return new NextResponse("Not Found", { status: 404 });
+    }
+  }
+
+  const filename = assetPath[assetPath.length - 1] ?? "file";
+  const safeFilename = filename.replace(/["\\\r\n]/g, "_");
+
+  try {
+    if (isSharedBibliography) {
+      const content = await citedBibliography(project.userId, project.slug, fileRecord.filePath);
+      return new Response(head ? null : content, {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Length": String(Buffer.byteLength(content)),
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+    if (head) {
+      const metadata = await getWorkspaceFileFingerprint(project.userId, project.slug, rel);
+      return new Response(null, {
+        headers: {
+          ETag: metadata.etag,
+          "Content-Length": metadata.size,
+          ...(metadata.updated ? { "Last-Modified": new Date(metadata.updated).toUTCString() } : {}),
+          "Cache-Control": "no-store",
+          "Content-Type": CONTENT_TYPES[path.extname(rel).toLowerCase()] ?? "application/octet-stream",
+        },
+      });
+    }
+    // The generated form runtime derives its submit endpoint from this URL.
+    // Keep the iframe on /api/share/... instead of redirecting to a file ticket.
+    if (rel === fileRecord.filePath && rel.toLowerCase().endsWith(".form.html")) {
+      const response = await readAgentWorkspaceFile(project.userId, project.slug, rel);
+      const html = await response.text();
+      const formHtml = withFormTheme(html);
+      const themedHtml = /<\/head>/i.test(formHtml)
+        ? formHtml.replace(/<\/head>/i, `${FORM_THEME_BRIDGE}</head>`)
+        : `${FORM_THEME_BRIDGE}${formHtml}`;
+      return new Response(themedHtml, {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups", "Cache-Control": "no-store" },
+      });
+    }
+
+    const download = new URL(request.url).searchParams.get("download") === "file";
+    const response = await readAgentWorkspaceFile(project.userId, project.slug, rel, {
+      range: request.headers.get("range") ?? undefined,
+      ifNoneMatch: request.headers.get("if-none-match") ?? undefined,
+    });
+    const headers = new Headers(response.headers);
+    headers.set("Content-Type", CONTENT_TYPES[path.extname(rel).toLowerCase()] ?? "application/octet-stream");
+    headers.set("Content-Disposition", `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(safeFilename)}`);
+    // Serve on the share URL itself. A ticket redirect can resolve against
+    // localhost behind a tunnel, which public browsers cannot reach.
+    return new Response(response.body, {
+      status: response.status,
+      headers,
+    });
+  } catch (error) {
+    if (error instanceof AgentWorkspaceError) {
+      return new NextResponse(error.message, { status: error.status });
+    }
+    console.error("[share-asset] agent workspace failed", error);
+    return new NextResponse("Unable to reach workspace storage", { status: 502 });
+  }
+}
+
+type AssetContext = { params: Promise<{ shareId: string; assetPath: string[] }> };
+
+export function GET(request: Request, context: AssetContext) {
+  return serveAsset(request, context, false);
+}
+
+export function HEAD(request: Request, context: AssetContext) {
+  return serveAsset(request, context, true);
+}
